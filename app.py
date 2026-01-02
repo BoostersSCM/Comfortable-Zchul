@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 from datetime import datetime, timedelta
+
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 import requests
@@ -36,7 +37,7 @@ def get_login_url():
         "scope": "openid email profile",
         "access_type": "offline",
         "prompt": "consent",
-        "hd": "boosters.kr",
+        "hd": "boosters.kr",  # 도메인 힌트
     }
     return f"{base_url}?{urllib.parse.urlencode(params)}"
 
@@ -57,7 +58,16 @@ def get_user_info(access_token: str) -> dict:
     return requests.get(user_info_url, headers=headers, timeout=15).json()
 
 # =========================================================
-# 3. 로그인 유지(쿠키)
+# 3. Query Params 안전 접근 (문자열/리스트 모두 대응)
+# =========================================================
+def qp_first(key: str):
+    v = st.query_params.get(key)
+    if isinstance(v, list):
+        return v[0] if v else None
+    return v
+
+# =========================================================
+# 4. 로그인 유지(쿠키)
 # =========================================================
 COOKIE_EMAIL = "boosters_login"
 COOKIE_EXPIRY = "boosters_login_expiry"
@@ -96,14 +106,11 @@ def restore_login_from_cookie() -> bool:
     return False
 
 # =========================================================
-# 4. 엑셀 읽기(헤더행 선택 지원)
+# 5. 파일 읽기(헤더행 선택)
 # =========================================================
 def read_file_with_header(uploaded_file, header_row_excel_1based: int, header_row_csv_1based: int = 1):
-    """
-    header_row_*_1based: 사용자가 보는 행 번호(1부터)
-    pandas header는 0부터이므로 -1 해서 적용
-    """
     name = uploaded_file.name.lower()
+
     if name.endswith(".csv"):
         header_idx = max(header_row_csv_1based - 1, 0)
         try:
@@ -120,7 +127,7 @@ def read_file_with_header(uploaded_file, header_row_excel_1based: int, header_ro
     return df
 
 # =========================================================
-# 5. ERP 데이터 처리
+# 6. ERP 데이터 처리
 # =========================================================
 def load_and_aggregate_data(uploaded_file, header_row_excel_1based: int):
     try:
@@ -128,14 +135,14 @@ def load_and_aggregate_data(uploaded_file, header_row_excel_1based: int):
     except Exception as e:
         return None, f"파일 읽기 실패: {e}"
 
-    # 컬럼 정리
     df.columns = [str(col).strip() for col in df.columns]
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
 
-    # 실제 헤더가 아닌 경우(숫자/데이터값이 헤더로 잡힌 경우) 빠르게 감지
-    # 예: ['0','1','4252',...]
-    if len(df.columns) > 0 and all(str(c).replace(".", "", 1).isdigit() for c in df.columns[:5]):
-        return None, "헤더 행이 데이터 행으로 잡혔습니다. '엑셀 헤더 행' 값을 한 줄 올리거나 내려서 다시 시도하세요."
+    # 헤더가 데이터로 잡힌 케이스 빠른 안내
+    if len(df.columns) >= 5:
+        sample_cols = [str(c) for c in df.columns[:5]]
+        if all(s.replace(".", "", 1).isdigit() for s in sample_cols):
+            return None, "헤더 행이 데이터 행으로 잡혔습니다. '엑셀 헤더 행' 값을 한 줄 올리거나 내려서 다시 시도하세요."
 
     column_mapping = {
         "거래처": "업체",
@@ -156,7 +163,6 @@ def load_and_aggregate_data(uploaded_file, header_row_excel_1based: int):
     df_extracted = df[valid_cols].copy()
     df_extracted.rename(columns=column_mapping, inplace=True)
 
-    # 숫자 변환
     numeric_cols = ["납품수량", "납품금액(세전)", "부가세", "납품금액(세후)"]
     for col in numeric_cols:
         df_extracted[col] = pd.to_numeric(
@@ -164,13 +170,11 @@ def load_and_aggregate_data(uploaded_file, header_row_excel_1based: int):
             errors="coerce",
         ).fillna(0)
 
-    # 집계
     group_keys = ["업체", "발주번호", "품번", "품명"]
     df_grouped = df_extracted.groupby(group_keys, as_index=False)[
         ["납품수량", "납품금액(세전)", "부가세", "납품금액(세후)"]
     ].sum()
 
-    # 단가 재계산
     df_grouped["납품단가"] = df_grouped.apply(
         lambda x: x["납품금액(세전)"] / x["납품수량"] if x["납품수량"] != 0 else 0,
         axis=1,
@@ -183,7 +187,6 @@ def load_and_aggregate_data(uploaded_file, header_row_excel_1based: int):
         "납품단가", "납품수량", "납품금액(세전)", "부가세", "납품금액(세후)"
     ]
     df_final = df_grouped[desired_order].copy()
-
     df_final["선금 지급일"] = ""
     df_final["선금 금액"] = 0
     df_final["잔여금액"] = 0
@@ -219,7 +222,7 @@ def create_excel_with_formula(df: pd.DataFrame) -> BytesIO:
     return final_output
 
 # =========================================================
-# 6. 화면 표시용 DF (Styler 미사용)
+# 7. 화면 표시용 DF (Styler 미사용)
 # =========================================================
 def make_display_df(df: pd.DataFrame) -> pd.DataFrame:
     df_disp = df.copy()
@@ -231,7 +234,7 @@ def make_display_df(df: pd.DataFrame) -> pd.DataFrame:
     return df_disp
 
 # =========================================================
-# 7. 메인 앱
+# 8. 메인 앱
 # =========================================================
 def main_app():
     with st.sidebar:
@@ -285,7 +288,7 @@ def main_app():
         )
 
 # =========================================================
-# 8. 실행 흐름
+# 9. 실행 흐름 제어
 # =========================================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -296,21 +299,23 @@ if "user_email" not in st.session_state:
 if not st.session_state.logged_in:
     restore_login_from_cookie()
 
-query_params = st.query_params
-
-if "error" in query_params:
+# OAuth 에러 표시 (안전하게)
+err = qp_first("error")
+if err:
     st.error("Google OAuth 에러 발생")
-    st.write(query_params)
+    st.write(st.query_params)
     st.stop()
 
+# 로그인 처리
+code = qp_first("code")
+
 if not st.session_state.logged_in:
-    if "code" in query_params:
-        code = query_params["code"]
+    if code:
         token_res = get_token_from_code(code)
 
         if "access_token" not in token_res:
             st.error("로그인 실패: 토큰 발급 실패")
-            st.write(token_res)
+            st.write(token_res)  # 원인 확인용
             st.stop()
 
         user_info = get_user_info(token_res["access_token"])
@@ -320,11 +325,13 @@ if not st.session_state.logged_in:
             st.session_state.logged_in = True
             st.session_state.user_email = email
             set_login_cookie(email, days=COOKIE_DAYS)
+
             st.query_params.clear()
             st.rerun()
         else:
             st.error(f"접속 권한이 없습니다. ({email}) @boosters.kr 계정만 가능합니다.")
             st.stop()
+
     else:
         st.title("🔒 Boosters Internal Tool")
         st.write("관계자 외 접근을 금지합니다.")
