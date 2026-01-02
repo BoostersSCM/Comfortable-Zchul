@@ -19,7 +19,14 @@ try:
 except Exception:
     st.error("⚠️ Secrets 설정이 되어있지 않습니다. Streamlit Cloud의 Settings > Secrets를 확인해주세요.")
     st.stop()
+    
+query_params = st.query_params
 
+if "error" in query_params:
+    st.error(f"OAuth error: {query_params.get('error')}")
+    st.write(query_params)
+    st.stop()
+    
 def get_login_url():
     """구글 로그인 URL 생성"""
     base_url = "https://accounts.google.com/o/oauth2/v2/auth"
