@@ -37,7 +37,7 @@ def get_login_url():
         "scope": "openid email profile",
         "access_type": "offline",
         "prompt": "consent",
-        "hd": "boosters.kr",  # 도메인 힌트
+        "hd": "boosters.kr",
     }
     return f"{base_url}?{urllib.parse.urlencode(params)}"
 
@@ -50,21 +50,63 @@ def get_token_from_code(code: str) -> dict:
         "redirect_uri": REDIRECT_URI,
         "grant_type": "authorization_code",
     }
-    return requests.post(token_url, data=data, timeout=15).json()
+    return requests.post(token_url, data=data, timeout=20).json()
 
 def get_user_info(access_token: str) -> dict:
     user_info_url = "https://openidconnect.googleapis.com/v1/userinfo"
     headers = {"Authorization": f"Bearer {access_token}"}
-    return requests.get(user_info_url, headers=headers, timeout=15).json()
+    return requests.get(user_info_url, headers=headers, timeout=20).json()
 
 # =========================================================
-# 3. Query Params 안전 접근 (문자열/리스트 모두 대응)
+# 3. Query params 호환 레이어 (중요)
 # =========================================================
+def get_all_query_params() -> dict:
+    """
+    Streamlit 버전에 따라 query params API가 달라서 둘 다 지원.
+    반환 형태는 dict[str, list[str]] 로 통일.
+    """
+    # 최신: st.query_params
+    if hasattr(st, "query_params"):
+        qp_obj = st.query_params
+        # QueryParams는 dict처럼 동작하지만, to_dict가 없는 버전도 있어서 안전하게 변환
+        out = {}
+        try:
+            for k in qp_obj.keys():
+                v = qp_obj.get(k)
+                if isinstance(v, list):
+                    out[k] = v
+                elif v is None:
+                    out[k] = []
+                else:
+                    out[k] = [str(v)]
+            return out
+        except Exception:
+            pass
+
+    # 구버전: st.experimental_get_query_params
+    if hasattr(st, "experimental_get_query_params"):
+        qp = st.experimental_get_query_params()
+        # 이미 dict[str, list[str]]
+        return {k: [str(x) for x in v] for k, v in qp.items()}
+
+    return {}
+
 def qp_first(key: str):
-    v = st.query_params.get(key)
-    if isinstance(v, list):
-        return v[0] if v else None
-    return v
+    qp = get_all_query_params()
+    v = qp.get(key, [])
+    return v[0] if v else None
+
+def clear_query_params():
+    # 최신
+    if hasattr(st, "query_params"):
+        try:
+            st.query_params.clear()
+            return
+        except Exception:
+            pass
+    # 구버전
+    if hasattr(st, "experimental_set_query_params"):
+        st.experimental_set_query_params()
 
 # =========================================================
 # 4. 로그인 유지(쿠키)
@@ -137,12 +179,6 @@ def load_and_aggregate_data(uploaded_file, header_row_excel_1based: int):
 
     df.columns = [str(col).strip() for col in df.columns]
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
-
-    # 헤더가 데이터로 잡힌 케이스 빠른 안내
-    if len(df.columns) >= 5:
-        sample_cols = [str(c) for c in df.columns[:5]]
-        if all(s.replace(".", "", 1).isdigit() for s in sample_cols):
-            return None, "헤더 행이 데이터 행으로 잡혔습니다. '엑셀 헤더 행' 값을 한 줄 올리거나 내려서 다시 시도하세요."
 
     column_mapping = {
         "거래처": "업체",
@@ -249,14 +285,12 @@ def main_app():
 
     uploaded_file = st.file_uploader("파일 업로드 (xlsx, xls, csv)", type=["xlsx", "xls", "csv"])
 
-    # ✅ 헤더 행 선택(기본 2행)
     header_row_excel = st.number_input("엑셀 헤더 행(1부터)", min_value=1, value=2, step=1)
 
     if "processed_data" not in st.session_state:
         st.session_state.processed_data = None
 
     if uploaded_file:
-        # ✅ 헤더 미리보기
         with st.expander("🔎 헤더 미리보기(현재 설정 기준)", expanded=True):
             try:
                 preview = read_file_with_header(uploaded_file, header_row_excel_1based=header_row_excel)
@@ -288,7 +322,7 @@ def main_app():
         )
 
 # =========================================================
-# 9. 실행 흐름 제어
+# 9. 실행 흐름 제어 (로그인)
 # =========================================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -299,26 +333,42 @@ if "user_email" not in st.session_state:
 if not st.session_state.logged_in:
     restore_login_from_cookie()
 
-# OAuth 에러 표시 (안전하게)
+# ---- 디버그: 현재 쿼리 파라미터 확인 (로그인 안 될 때 매우 유용)
+# 필요 없으면 주석 처리 가능
+DEBUG_OAUTH = True
+
+qp_all = get_all_query_params()
 err = qp_first("error")
+code = qp_first("code")
+
+if DEBUG_OAUTH and (err or code):
+    st.info("🔍 OAuth 디버그(현재 URL 쿼리 파라미터)")
+    st.write(qp_all)
+
+# OAuth error 처리
 if err:
     st.error("Google OAuth 에러 발생")
-    st.write(st.query_params)
+    st.write(qp_all)
     st.stop()
 
 # 로그인 처리
-code = qp_first("code")
-
 if not st.session_state.logged_in:
     if code:
         token_res = get_token_from_code(code)
 
+        if DEBUG_OAUTH:
+            st.info("🔍 Token response")
+            st.write(token_res)
+
         if "access_token" not in token_res:
             st.error("로그인 실패: 토큰 발급 실패")
-            st.write(token_res)  # 원인 확인용
             st.stop()
 
         user_info = get_user_info(token_res["access_token"])
+        if DEBUG_OAUTH:
+            st.info("🔍 User info")
+            st.write(user_info)
+
         email = user_info.get("email", "")
 
         if email.endswith("@boosters.kr"):
@@ -326,7 +376,7 @@ if not st.session_state.logged_in:
             st.session_state.user_email = email
             set_login_cookie(email, days=COOKIE_DAYS)
 
-            st.query_params.clear()
+            clear_query_params()
             st.rerun()
         else:
             st.error(f"접속 권한이 없습니다. ({email}) @boosters.kr 계정만 가능합니다.")
