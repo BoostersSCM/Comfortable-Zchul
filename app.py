@@ -3,7 +3,6 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 from datetime import datetime, timedelta
-
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 import requests
@@ -41,7 +40,6 @@ def get_login_url():
     }
     return f"{base_url}?{urllib.parse.urlencode(params)}"
 
-
 def get_token_from_code(code: str) -> dict:
     token_url = "https://oauth2.googleapis.com/token"
     data = {
@@ -52,7 +50,6 @@ def get_token_from_code(code: str) -> dict:
         "grant_type": "authorization_code",
     }
     return requests.post(token_url, data=data, timeout=15).json()
-
 
 def get_user_info(access_token: str) -> dict:
     user_info_url = "https://openidconnect.googleapis.com/v1/userinfo"
@@ -85,48 +82,60 @@ def clear_login_cookie():
 def restore_login_from_cookie() -> bool:
     if not cookies_supported():
         return False
-
     email = st.cookies.get(COOKIE_EMAIL)
     expiry = st.cookies.get(COOKIE_EXPIRY)
-
     if not email or not expiry:
         return False
-
     try:
-        if datetime.utcnow() < datetime.fromisoformat(expiry):
-            if email.endswith("@boosters.kr"):
-                st.session_state.logged_in = True
-                st.session_state.user_email = email
-                return True
+        if datetime.utcnow() < datetime.fromisoformat(expiry) and email.endswith("@boosters.kr"):
+            st.session_state.logged_in = True
+            st.session_state.user_email = email
+            return True
     except Exception:
         return False
-
     return False
 
 # =========================================================
-# 4. ERP 데이터 처리 (엑셀 헤더 2행 고정)
+# 4. 엑셀 읽기(헤더행 선택 지원)
 # =========================================================
-def load_and_aggregate_data(uploaded_file):
-    try:
-        HEADER_ROW_EXCEL = 1  # ✅ 엑셀 2행이 헤더
-        HEADER_ROW_CSV = 0
-
-        if uploaded_file.name.lower().endswith(".csv"):
-            try:
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, header=HEADER_ROW_CSV)
-            except Exception:
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, header=HEADER_ROW_CSV, encoding="cp949")
-        else:
+def read_file_with_header(uploaded_file, header_row_excel_1based: int, header_row_csv_1based: int = 1):
+    """
+    header_row_*_1based: 사용자가 보는 행 번호(1부터)
+    pandas header는 0부터이므로 -1 해서 적용
+    """
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        header_idx = max(header_row_csv_1based - 1, 0)
+        try:
             uploaded_file.seek(0)
-            df = pd.read_excel(uploaded_file, header=HEADER_ROW_EXCEL, engine="openpyxl")
+            df = pd.read_csv(uploaded_file, header=header_idx)
+        except Exception:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, header=header_idx, encoding="cp949")
+        return df
 
+    header_idx = max(header_row_excel_1based - 1, 0)
+    uploaded_file.seek(0)
+    df = pd.read_excel(uploaded_file, header=header_idx, engine="openpyxl")
+    return df
+
+# =========================================================
+# 5. ERP 데이터 처리
+# =========================================================
+def load_and_aggregate_data(uploaded_file, header_row_excel_1based: int):
+    try:
+        df = read_file_with_header(uploaded_file, header_row_excel_1based=header_row_excel_1based)
     except Exception as e:
         return None, f"파일 읽기 실패: {e}"
 
+    # 컬럼 정리
     df.columns = [str(col).strip() for col in df.columns]
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
+
+    # 실제 헤더가 아닌 경우(숫자/데이터값이 헤더로 잡힌 경우) 빠르게 감지
+    # 예: ['0','1','4252',...]
+    if len(df.columns) > 0 and all(str(c).replace(".", "", 1).isdigit() for c in df.columns[:5]):
+        return None, "헤더 행이 데이터 행으로 잡혔습니다. '엑셀 헤더 행' 값을 한 줄 올리거나 내려서 다시 시도하세요."
 
     column_mapping = {
         "거래처": "업체",
@@ -147,19 +156,21 @@ def load_and_aggregate_data(uploaded_file):
     df_extracted = df[valid_cols].copy()
     df_extracted.rename(columns=column_mapping, inplace=True)
 
+    # 숫자 변환
     numeric_cols = ["납품수량", "납품금액(세전)", "부가세", "납품금액(세후)"]
     for col in numeric_cols:
-        if col in df_extracted.columns:
-            df_extracted[col] = pd.to_numeric(
-                df_extracted[col].astype(str).str.replace(",", ""),
-                errors="coerce",
-            ).fillna(0)
+        df_extracted[col] = pd.to_numeric(
+            df_extracted[col].astype(str).str.replace(",", ""),
+            errors="coerce",
+        ).fillna(0)
 
+    # 집계
     group_keys = ["업체", "발주번호", "품번", "품명"]
     df_grouped = df_extracted.groupby(group_keys, as_index=False)[
         ["납품수량", "납품금액(세전)", "부가세", "납품금액(세후)"]
     ].sum()
 
+    # 단가 재계산
     df_grouped["납품단가"] = df_grouped.apply(
         lambda x: x["납품금액(세전)"] / x["납품수량"] if x["납품수량"] != 0 else 0,
         axis=1,
@@ -189,15 +200,14 @@ def create_excel_with_formula(df: pd.DataFrame) -> BytesIO:
     ws = wb.active
 
     header_map = {str(cell.value).strip(): cell.col_idx for cell in ws[1]}
-
-    if "납품금액(세후)" in header_map and "선금 금액" in header_map and "잔여금액" in header_map:
+    needed = {"납품금액(세후)", "선금 금액", "잔여금액"}
+    if needed.issubset(set(header_map.keys())):
         col_total = get_column_letter(header_map["납품금액(세후)"])
         col_prepay = get_column_letter(header_map["선금 금액"])
         col_balance = get_column_letter(header_map["잔여금액"])
 
         for r in range(2, ws.max_row + 1):
             ws[f"{col_balance}{r}"] = f"={col_total}{r}-{col_prepay}{r}"
-
             cols_to_format = ["납품단가", "납품금액(세전)", "부가세", "납품금액(세후)", "선금 금액", "잔여금액"]
             for col_name in cols_to_format:
                 if col_name in header_map:
@@ -209,72 +219,73 @@ def create_excel_with_formula(df: pd.DataFrame) -> BytesIO:
     return final_output
 
 # =========================================================
-# 5. 메인 앱
+# 6. 화면 표시용 DF (Styler 미사용)
+# =========================================================
+def make_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    df_disp = df.copy()
+    num_cols = ["납품단가", "납품수량", "납품금액(세전)", "부가세", "납품금액(세후)", "선금 금액", "잔여금액"]
+    for c in num_cols:
+        if c in df_disp.columns:
+            s = pd.to_numeric(df_disp[c], errors="coerce").fillna(0)
+            df_disp[c] = s.map(lambda x: f"{int(round(x)):,}")
+    return df_disp
+
+# =========================================================
+# 7. 메인 앱
 # =========================================================
 def main_app():
     with st.sidebar:
         st.success(f"접속자: {st.session_state.user_email}")
-
         if st.button("로그아웃"):
             st.session_state.clear()
             clear_login_cookie()
             st.rerun()
-
         st.caption(f"로그인 유지: {COOKIE_DAYS}일 (쿠키 기반)")
 
     st.title("📊 납품대금 집계 프로그램")
-    st.markdown(
-        """
-        ERP 파일을 업로드하고 **[변환 및 집계 실행]**을 누르면  
-        **업체별/발주번호별**로 자동 집계하여 정리해줍니다.
-        """
-    )
 
     uploaded_file = st.file_uploader("파일 업로드 (xlsx, xls, csv)", type=["xlsx", "xls", "csv"])
+
+    # ✅ 헤더 행 선택(기본 2행)
+    header_row_excel = st.number_input("엑셀 헤더 행(1부터)", min_value=1, value=2, step=1)
 
     if "processed_data" not in st.session_state:
         st.session_state.processed_data = None
 
-    if uploaded_file and st.button("🚀 변환 및 집계 실행", type="primary"):
-        with st.spinner("데이터 분석 중..."):
-            df_result, error_msg = load_and_aggregate_data(uploaded_file)
-            if df_result is not None:
-                st.session_state.processed_data = df_result
-                st.success("집계 완료!")
-            else:
-                st.error(f"오류: {error_msg}")
+    if uploaded_file:
+        # ✅ 헤더 미리보기
+        with st.expander("🔎 헤더 미리보기(현재 설정 기준)", expanded=True):
+            try:
+                preview = read_file_with_header(uploaded_file, header_row_excel_1based=header_row_excel)
+                st.write("감지된 컬럼:", list(preview.columns))
+                st.dataframe(preview.head(5), use_container_width=True)
+            except Exception as e:
+                st.error(f"미리보기 실패: {e}")
+
+        if st.button("🚀 변환 및 집계 실행", type="primary"):
+            with st.spinner("데이터 분석 중..."):
+                df_result, error_msg = load_and_aggregate_data(uploaded_file, header_row_excel_1based=header_row_excel)
+                if df_result is not None:
+                    st.session_state.processed_data = df_result
+                    st.success("집계 완료!")
+                else:
+                    st.error(f"오류: {error_msg}")
 
     if st.session_state.processed_data is not None:
         st.divider()
         st.subheader("📋 결과 미리보기")
-
-        # ✅ 숫자 컬럼만 포맷 적용 (ValueError 방지)
-        format_dict = {
-            "납품단가": "{:,.0f}",
-            "납품수량": "{:,.0f}",
-            "납품금액(세전)": "{:,.0f}",
-            "부가세": "{:,.0f}",
-            "납품금액(세후)": "{:,.0f}",
-            "선금 금액": "{:,.0f}",
-            "잔여금액": "{:,.0f}",
-        }
-        valid_format = {k: v for k, v in format_dict.items() if k in st.session_state.processed_data.columns}
-
-        st.dataframe(
-            st.session_state.processed_data.style.format(valid_format),
-            use_container_width=True
-        )
+        st.dataframe(make_display_df(st.session_state.processed_data), use_container_width=True)
 
         excel_data = create_excel_with_formula(st.session_state.processed_data)
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
             file_name="납품대금_집계표.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
 # =========================================================
-# 6. 실행 흐름 제어
+# 8. 실행 흐름
 # =========================================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -287,18 +298,16 @@ if not st.session_state.logged_in:
 
 query_params = st.query_params
 
-# OAuth 에러 표시
 if "error" in query_params:
     st.error("Google OAuth 에러 발생")
     st.write(query_params)
     st.stop()
 
-# 로그인 처리
 if not st.session_state.logged_in:
     if "code" in query_params:
         code = query_params["code"]
-
         token_res = get_token_from_code(code)
+
         if "access_token" not in token_res:
             st.error("로그인 실패: 토큰 발급 실패")
             st.write(token_res)
@@ -310,19 +319,15 @@ if not st.session_state.logged_in:
         if email.endswith("@boosters.kr"):
             st.session_state.logged_in = True
             st.session_state.user_email = email
-
             set_login_cookie(email, days=COOKIE_DAYS)
-
             st.query_params.clear()
             st.rerun()
         else:
             st.error(f"접속 권한이 없습니다. ({email}) @boosters.kr 계정만 가능합니다.")
             st.stop()
-
     else:
         st.title("🔒 Boosters Internal Tool")
         st.write("관계자 외 접근을 금지합니다.")
-
         login_url = get_login_url()
         st.markdown(
             f"""
@@ -335,9 +340,8 @@ if not st.session_state.logged_in:
                 </button>
             </a>
             """,
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
-
         if not cookies_supported():
             st.warning("현재 Streamlit 버전에서 st.cookies가 지원되지 않아 '로그인 유지'가 동작하지 않을 수 있습니다.")
 else:
