@@ -25,7 +25,6 @@ except Exception:
     st.error("⚠️ Secrets 설정이 되어있지 않습니다. Streamlit Cloud의 Settings > Secrets를 확인해주세요.")
     st.stop()
 
-
 # =========================================================
 # 2. Google OAuth 함수
 # =========================================================
@@ -38,7 +37,7 @@ def get_login_url():
         "scope": "openid email profile",
         "access_type": "offline",
         "prompt": "consent",
-        "hd": "boosters.kr",  # 도메인 힌트(강제는 아니지만 UX 개선)
+        "hd": "boosters.kr",
     }
     return f"{base_url}?{urllib.parse.urlencode(params)}"
 
@@ -56,18 +55,16 @@ def get_token_from_code(code: str) -> dict:
 
 
 def get_user_info(access_token: str) -> dict:
-    # OpenID 표준 userinfo endpoint
     user_info_url = "https://openidconnect.googleapis.com/v1/userinfo"
     headers = {"Authorization": f"Bearer {access_token}"}
     return requests.get(user_info_url, headers=headers, timeout=15).json()
 
-
 # =========================================================
-# 3. 로그인 유지(쿠키) 유틸
+# 3. 로그인 유지(쿠키)
 # =========================================================
 COOKIE_EMAIL = "boosters_login"
 COOKIE_EXPIRY = "boosters_login_expiry"
-COOKIE_DAYS = 7  # 로그인 유지 기간(원하면 변경)
+COOKIE_DAYS = 7
 
 def cookies_supported() -> bool:
     return hasattr(st, "cookies")
@@ -86,10 +83,6 @@ def clear_login_cookie():
     st.cookies.pop(COOKIE_EXPIRY, None)
 
 def restore_login_from_cookie() -> bool:
-    """
-    쿠키가 있으면 세션 로그인 상태 복원.
-    쿠키는 '이메일+만료시간'만 저장(토큰 저장 X).
-    """
     if not cookies_supported():
         return False
 
@@ -110,15 +103,13 @@ def restore_login_from_cookie() -> bool:
 
     return False
 
-
 # =========================================================
-# 4. 데이터 처리(ERP) 관련 함수
-#    - 엑셀 헤더는 "2행"이라고 했으니 header=1로 고정
+# 4. ERP 데이터 처리 (엑셀 헤더 2행 고정)
 # =========================================================
 def load_and_aggregate_data(uploaded_file):
     try:
         HEADER_ROW_EXCEL = 1  # ✅ 엑셀 2행이 헤더
-        HEADER_ROW_CSV = 0    # CSV는 보통 1행이 헤더
+        HEADER_ROW_CSV = 0
 
         if uploaded_file.name.lower().endswith(".csv"):
             try:
@@ -134,9 +125,7 @@ def load_and_aggregate_data(uploaded_file):
     except Exception as e:
         return None, f"파일 읽기 실패: {e}"
 
-    # 컬럼 정리
     df.columns = [str(col).strip() for col in df.columns]
-    # Unnamed 컬럼 제거
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
 
     column_mapping = {
@@ -158,7 +147,6 @@ def load_and_aggregate_data(uploaded_file):
     df_extracted = df[valid_cols].copy()
     df_extracted.rename(columns=column_mapping, inplace=True)
 
-    # 숫자 변환
     numeric_cols = ["납품수량", "납품금액(세전)", "부가세", "납품금액(세후)"]
     for col in numeric_cols:
         if col in df_extracted.columns:
@@ -167,24 +155,18 @@ def load_and_aggregate_data(uploaded_file):
                 errors="coerce",
             ).fillna(0)
 
-    # 집계(GroupBy)
     group_keys = ["업체", "발주번호", "품번", "품명"]
-    df_grouped = (
-        df_extracted.groupby(group_keys, as_index=False)[
-            ["납품수량", "납품금액(세전)", "부가세", "납품금액(세후)"]
-        ].sum()
-    )
+    df_grouped = df_extracted.groupby(group_keys, as_index=False)[
+        ["납품수량", "납품금액(세전)", "부가세", "납품금액(세후)"]
+    ].sum()
 
-    # 단가 재계산
     df_grouped["납품단가"] = df_grouped.apply(
         lambda x: x["납품금액(세전)"] / x["납품수량"] if x["납품수량"] != 0 else 0,
         axis=1,
     )
 
-    # 정렬
     df_grouped = df_grouped.sort_values(by=["업체", "발주번호", "품번"])
 
-    # 컬럼 순서 및 추가
     desired_order = [
         "업체", "발주번호", "품번", "품명",
         "납품단가", "납품수량", "납품금액(세전)", "부가세", "납품금액(세후)"
@@ -196,7 +178,6 @@ def load_and_aggregate_data(uploaded_file):
     df_final["잔여금액"] = 0
 
     return df_final, None
-
 
 def create_excel_with_formula(df: pd.DataFrame) -> BytesIO:
     output = BytesIO()
@@ -214,11 +195,9 @@ def create_excel_with_formula(df: pd.DataFrame) -> BytesIO:
         col_prepay = get_column_letter(header_map["선금 금액"])
         col_balance = get_column_letter(header_map["잔여금액"])
 
-        row_count = ws.max_row
-        for r in range(2, row_count + 1):
+        for r in range(2, ws.max_row + 1):
             ws[f"{col_balance}{r}"] = f"={col_total}{r}-{col_prepay}{r}"
 
-            # 숫자 포맷
             cols_to_format = ["납품단가", "납품금액(세전)", "부가세", "납품금액(세후)", "선금 금액", "잔여금액"]
             for col_name in cols_to_format:
                 if col_name in header_map:
@@ -229,9 +208,8 @@ def create_excel_with_formula(df: pd.DataFrame) -> BytesIO:
     final_output.seek(0)
     return final_output
 
-
 # =========================================================
-# 5. 메인 앱 화면(로그인 성공 시)
+# 5. 메인 앱
 # =========================================================
 def main_app():
     with st.sidebar:
@@ -257,20 +235,20 @@ def main_app():
     if "processed_data" not in st.session_state:
         st.session_state.processed_data = None
 
-    if uploaded_file:
-        if st.button("🚀 변환 및 집계 실행", type="primary"):
-            with st.spinner("데이터 분석 중..."):
-                df_result, error_msg = load_and_aggregate_data(uploaded_file)
-                if df_result is not None:
-                    st.session_state.processed_data = df_result
-                    st.success("집계 완료!")
-                else:
-                    st.error(f"오류: {error_msg}")
+    if uploaded_file and st.button("🚀 변환 및 집계 실행", type="primary"):
+        with st.spinner("데이터 분석 중..."):
+            df_result, error_msg = load_and_aggregate_data(uploaded_file)
+            if df_result is not None:
+                st.session_state.processed_data = df_result
+                st.success("집계 완료!")
+            else:
+                st.error(f"오류: {error_msg}")
 
     if st.session_state.processed_data is not None:
         st.divider()
         st.subheader("📋 결과 미리보기")
 
+        # ✅ 숫자 컬럼만 포맷 적용 (ValueError 방지)
         format_dict = {
             "납품단가": "{:,.0f}",
             "납품수량": "{:,.0f}",
@@ -284,7 +262,7 @@ def main_app():
 
         st.dataframe(
             st.session_state.processed_data.style.format(valid_format),
-            use_container_width=True,
+            use_container_width=True
         )
 
         excel_data = create_excel_with_formula(st.session_state.processed_data)
@@ -292,32 +270,30 @@ def main_app():
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
             file_name="납품대금_집계표.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-
 # =========================================================
-# 6. 실행 흐름 제어 (로그인 체크)
+# 6. 실행 흐름 제어
 # =========================================================
-# 세션 상태 초기화
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "user_email" not in st.session_state:
     st.session_state.user_email = ""
 
-# 1) 쿠키로 로그인 복원 시도
+# 쿠키로 로그인 복원
 if not st.session_state.logged_in:
     restore_login_from_cookie()
 
 query_params = st.query_params
 
-# 2) OAuth 에러(있으면 보여주고 종료)
+# OAuth 에러 표시
 if "error" in query_params:
     st.error("Google OAuth 에러 발생")
-    st.write(query_params)  # error / error_description 확인용
+    st.write(query_params)
     st.stop()
 
-# 3) 로그인 상태가 아니면 OAuth 처리
+# 로그인 처리
 if not st.session_state.logged_in:
     if "code" in query_params:
         code = query_params["code"]
@@ -325,21 +301,18 @@ if not st.session_state.logged_in:
         token_res = get_token_from_code(code)
         if "access_token" not in token_res:
             st.error("로그인 실패: 토큰 발급 실패")
-            st.write(token_res)  # 원인 확인용
+            st.write(token_res)
             st.stop()
 
         user_info = get_user_info(token_res["access_token"])
         email = user_info.get("email", "")
 
-        # 도메인 체크
         if email.endswith("@boosters.kr"):
             st.session_state.logged_in = True
             st.session_state.user_email = email
 
-            # ✅ 로그인 유지 쿠키 저장
             set_login_cookie(email, days=COOKIE_DAYS)
 
-            # URL 파라미터 정리 후 rerun
             st.query_params.clear()
             st.rerun()
         else:
@@ -347,7 +320,6 @@ if not st.session_state.logged_in:
             st.stop()
 
     else:
-        # 로그인 화면
         st.title("🔒 Boosters Internal Tool")
         st.write("관계자 외 접근을 금지합니다.")
 
@@ -363,11 +335,10 @@ if not st.session_state.logged_in:
                 </button>
             </a>
             """,
-            unsafe_allow_html=True,
+            unsafe_allow_html=True
         )
 
         if not cookies_supported():
             st.warning("현재 Streamlit 버전에서 st.cookies가 지원되지 않아 '로그인 유지'가 동작하지 않을 수 있습니다.")
 else:
-    # 로그인 상태면 메인 앱 실행
     main_app()
