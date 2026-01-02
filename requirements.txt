@@ -1,6 +1,6 @@
 streamlit
 pandas
 openpyxl
-google-auth-oauthlib
-google-auth
 requests
+google-auth
+google-auth-oauthlib
